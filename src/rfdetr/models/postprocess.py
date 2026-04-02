@@ -15,14 +15,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from rfdetr.utilities import box_ops
+from rfdetr.utilities.rotated_box_ops import box_cxcywha_to_corners
 
 
 class PostProcess(nn.Module):
     """This module converts the model's output into the format expected by the coco api"""
 
-    def __init__(self, num_select=300) -> None:
+    def __init__(self, num_select=300, oriented=False) -> None:
         super().__init__()
         self.num_select = num_select
+        self.oriented = oriented
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -44,6 +46,20 @@ class PostProcess(nn.Module):
         scores = topk_values
         topk_boxes = topk_indexes // out_logits.shape[2]
         labels = topk_indexes % out_logits.shape[2]
+
+        if self.oriented:
+            box_dim = out_bbox.shape[-1]
+            obb = torch.gather(out_bbox, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, box_dim))
+            img_h, img_w = target_sizes.unbind(1)
+            scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+            obb[..., :4] = obb[..., :4] * scale_fct[:, None, :]
+            corners = box_cxcywha_to_corners(obb)
+            results = [
+                {"scores": sc, "labels": lb, "boxes_obb": ob, "corners": cn}
+                for sc, lb, ob, cn in zip(scores, labels, obb, corners)
+            ]
+            return results
+
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
         boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
 

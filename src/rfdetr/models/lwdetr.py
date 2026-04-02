@@ -527,7 +527,8 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             ia_bce_loss=args.ia_bce_loss,
         )
     criterion.to(device)
-    postprocess = PostProcess(num_select=args.num_select)
+    oriented = getattr(args, "oriented", False)
+    postprocess = PostProcess(num_select=args.num_select, oriented=oriented)
 
     return criterion, postprocess
 
