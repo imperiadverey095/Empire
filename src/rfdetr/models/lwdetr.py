@@ -101,6 +101,7 @@ class LWDETR(nn.Module):
         two_stage=False,
         lite_refpoint_refine=False,
         bbox_reparam=False,
+        oriented=False,
     ):
         """Initializes the model.
         Parameters:
@@ -112,6 +113,7 @@ class LWDETR(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
             group_detr: Number of groups to speed detr training. Default is 1.
             lite_refpoint_refine: TODO
+            oriented: If True, add an angle prediction head for oriented bounding boxes.
         """
         super().__init__()
         self.num_queries = num_queries
@@ -119,6 +121,8 @@ class LWDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.oriented = oriented
+        self.angle_embed = MLP(hidden_dim, hidden_dim, 1, 3) if oriented else None
         self.segmentation_head = segmentation_head
 
         query_dim = 4
@@ -240,6 +244,10 @@ class LWDETR(nn.Module):
             else:
                 outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
 
+            if self.angle_embed is not None:
+                angle = self.angle_embed(hs).sigmoid() * math.pi
+                outputs_coord = torch.cat([outputs_coord, angle], dim=-1)
+
             outputs_class = self.class_embed(hs)
 
             if self.segmentation_head is not None:
@@ -306,6 +314,9 @@ class LWDETR(nn.Module):
                 outputs_coord = torch.concat([outputs_coord_cxcy, outputs_coord_wh], dim=-1)
             else:
                 outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
+            if self.angle_embed is not None:
+                angle = self.angle_embed(hs).sigmoid() * math.pi
+                outputs_coord = torch.cat([outputs_coord, angle], dim=-1)
             outputs_class = self.class_embed(hs)
             if self.segmentation_head is not None:
                 outputs_masks = self.segmentation_head(
@@ -461,6 +472,7 @@ def build_model(args: "BuilderArgs"):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        oriented=getattr(args, "oriented", False),
     )
     return model
 

@@ -80,6 +80,7 @@ class ModelConfig(BaseConfig):
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
+    oriented: bool = False
     mask_downsample_ratio: int = 4
     backbone_lora: bool = False
     freeze_encoder: bool = False
