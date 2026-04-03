@@ -49,7 +49,7 @@ class PostProcess(nn.Module):
 
         if self.oriented:
             box_dim = out_bbox.shape[-1]
-            obb = torch.gather(out_bbox, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, box_dim))
+            obb = torch.gather(out_bbox, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, box_dim)).clone()
             img_h, img_w = target_sizes.unbind(1)
             scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
             obb[..., :4] = obb[..., :4] * scale_fct[:, None, :]

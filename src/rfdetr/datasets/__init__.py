@@ -21,7 +21,7 @@ import torchvision
 from torch.utils.data import Dataset, Subset
 
 from rfdetr.datasets.coco import build_coco, build_roboflow_from_coco
-from rfdetr.datasets.dota import DotaDetection, build_dota
+from rfdetr.datasets.dota_detection import DotaDetection, build_dota
 from rfdetr.datasets.o365 import build_o365
 from rfdetr.datasets.yolo import YoloDetection, build_roboflow_from_yolo
 
