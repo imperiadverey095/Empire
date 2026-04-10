@@ -576,6 +576,80 @@ class TestCliExportMain:
             f"expected keys {expected_names}, got {set(dynamic_axes.keys())}"
         )
 
+    def test_tensorrt_flag_calls_trtexec(self, output_dir: str) -> None:
+        """When tensorrt=True, main() must call trtexec with the ONNX output path."""
+        trtexec_calls: list[str] = []
+
+        def fake_trtexec(onnx_path: str, args) -> str:
+            trtexec_calls.append(onnx_path)
+            return onnx_path.replace(".onnx", ".engine")
+
+        args = self._make_args(output_dir=output_dir, tensorrt=True)
+        onnx_output = str(args.output_dir) + "/inference_model.onnx"
+
+        mock_model = MagicMock()
+        mock_model.parameters.return_value = []
+        mock_model.backbone.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.projector.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.encoder.parameters.return_value = []
+        mock_model.transformer.parameters.return_value = []
+        mock_model.to.return_value = mock_model
+        mock_model.cpu.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_model.return_value = {
+            "pred_boxes": torch.zeros(1, 300, 4),
+            "pred_logits": torch.zeros(1, 300, 90),
+        }
+        mock_tensor = MagicMock()
+        mock_tensor.to.return_value = mock_tensor
+        mock_tensor.cpu.return_value = mock_tensor
+
+        with (
+            patch.object(_cli_export_module, "build_model", return_value=(mock_model, MagicMock(), MagicMock())),
+            patch.object(_cli_export_module, "make_infer_image", return_value=mock_tensor),
+            patch.object(_cli_export_module, "export_onnx", return_value=onnx_output),
+            patch.object(_cli_export_module, "trtexec", side_effect=fake_trtexec),
+            patch.object(_cli_export_module, "get_rank", return_value=0),
+        ):
+            _cli_export_module.main(args)
+
+        assert len(trtexec_calls) == 1, "trtexec should be called exactly once"
+        assert trtexec_calls[0] == onnx_output, f"trtexec called with {trtexec_calls[0]!r}, expected {onnx_output!r}"
+
+    def test_tensorrt_false_does_not_call_trtexec(self, output_dir: str) -> None:
+        """When tensorrt=False (default), main() must not call trtexec."""
+        trtexec_calls: list[str] = []
+
+        def fake_trtexec(onnx_path: str, args) -> str:
+            trtexec_calls.append(onnx_path)
+            return onnx_path.replace(".onnx", ".engine")
+
+        args = self._make_args(output_dir=output_dir, tensorrt=False)
+
+        mock_model = MagicMock()
+        mock_model.parameters.return_value = []
+        mock_model.backbone.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.projector.parameters.return_value = []
+        mock_model.backbone.__getitem__.return_value.encoder.parameters.return_value = []
+        mock_model.transformer.parameters.return_value = []
+        mock_model.to.return_value = mock_model
+        mock_model.cpu.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_tensor = MagicMock()
+        mock_tensor.to.return_value = mock_tensor
+        mock_tensor.cpu.return_value = mock_tensor
+
+        with (
+            patch.object(_cli_export_module, "build_model", return_value=(mock_model, MagicMock(), MagicMock())),
+            patch.object(_cli_export_module, "make_infer_image", return_value=mock_tensor),
+            patch.object(_cli_export_module, "export_onnx", return_value=str(args.output_dir) + "/model.onnx"),
+            patch.object(_cli_export_module, "trtexec", side_effect=fake_trtexec),
+            patch.object(_cli_export_module, "get_rank", return_value=0),
+        ):
+            _cli_export_module.main(args)
+
+        assert len(trtexec_calls) == 0, "trtexec must not be called when tensorrt=False"
+
 
 class TestExportPatchSize:
     """RFDETR.export() patch_size validation and shape-divisibility tests."""

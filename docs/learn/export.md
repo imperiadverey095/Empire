@@ -51,6 +51,7 @@ The `export()` method accepts several parameters to customize the export process
 | `force`         | `False`    | Deprecated and ignored.                                                                                                |
 | `shape`         | `None`     | Input shape as tuple `(height, width)`. Must be divisible by 14. If not provided, uses the model's default resolution. |
 | `batch_size`    | `1`        | Batch size for the exported model.                                                                                     |
+| `tensorrt`      | `False`    | When `True`, convert the ONNX model to a TensorRT `.engine` file. Requires TensorRT (`trtexec`) to be installed.       |
 
 ## Advanced Export Examples
 
@@ -118,6 +119,20 @@ If you want lower latency on NVIDIA GPUs, you can convert the exported ONNX mode
 - Install TensorRT (`trtexec` must be available in your `PATH`)
 - Export an ONNX model first (for example: `output/inference_model.onnx`)
 
+### Export Directly to TensorRT
+
+Pass `tensorrt=True` to `export()` to export ONNX and convert to a TensorRT engine in one step:
+
+```python
+from rfdetr import RFDETRMedium
+
+model = RFDETRMedium(pretrain_weights="<path/to/checkpoint.pth>")
+
+model.export(tensorrt=True)
+```
+
+This exports `output/inference_model.onnx` first and then produces `output/inference_model.engine`.
+
 ### Python API Conversion
 
 ```python
@@ -131,10 +146,78 @@ args = Namespace(
     dry_run=False,
 )
 
-trtexec("output/inference_model.onnx", args)
+engine_path = trtexec("output/inference_model.onnx", args)
 ```
 
-This produces `output/inference_model.engine`. If `profile=True`, it also writes an Nsight Systems report (`.nsys-rep`).
+`trtexec` returns the path to the generated `.engine` file. If `profile=True`, it also writes an Nsight Systems report (`.nsys-rep`).
+
+## Run Inference with `inference-models`
+
+[`inference-models`](https://github.com/roboflow/inference/tree/main/inference_models) is the
+recommended library for running RF-DETR inference. It supports multiple backends — PyTorch,
+ONNX, and TensorRT — with automatic backend selection and a unified API.
+
+### Installation
+
+```bash
+# CPU / PyTorch only
+pip install inference-models
+
+# With TensorRT support (NVIDIA GPU required)
+pip install "inference-models[trt-cu12]"  # CUDA 12.x
+```
+
+See the [inference-models installation guide](https://inference-models.roboflow.com/getting-started/installation/)
+for all installation options including Jetson and CUDA 11.x.
+
+### Load a Pre-trained RF-DETR Model
+
+```python
+import cv2
+from inference_models import AutoModel
+
+# Automatically selects the best available backend for your environment
+model = AutoModel.from_pretrained("rfdetr-base")
+
+image = cv2.imread("image.jpg")
+predictions = model(image)
+
+# Convert to supervision Detections
+detections = predictions[0].to_supervision()
+print(detections)
+```
+
+### Load a Local RF-DETR Checkpoint
+
+```python
+import cv2
+from inference_models import AutoModel
+
+# Load from a local .pth checkpoint (same file used by rfdetr for training)
+model = AutoModel.from_pretrained(
+    "/path/to/checkpoint.pth",
+    model_type="rfdetr-base",  # specify the architecture variant
+)
+
+image = cv2.imread("image.jpg")
+predictions = model(image)
+```
+
+### Force TensorRT Backend
+
+```python
+import cv2
+from inference_models import AutoModel, BackendType
+
+# Explicitly request TensorRT — requires TRT to be installed
+model = AutoModel.from_pretrained("rfdetr-base", backend=BackendType.TRT)
+
+image = cv2.imread("image.jpg")
+predictions = model(image)
+```
+
+`AutoModel.from_pretrained` accepts `backend="onnx"`, `backend="torch"`, or
+`backend="trt"` to override automatic backend selection.
 
 ## Using the Exported Model
 
@@ -174,5 +257,6 @@ boxes, labels = outputs
 After exporting your model, you may want to:
 
 - [Deploy to Roboflow](deploy.md) for cloud-based inference and workflow integration
-- Use the ONNX model with TensorRT for optimized GPU inference
+- Use [`inference-models`](https://github.com/roboflow/inference/tree/main/inference_models) for
+    multi-backend inference (PyTorch, ONNX, TensorRT) with automatic backend selection
 - Integrate with edge deployment frameworks like ONNX Runtime or OpenVINO
