@@ -18,7 +18,7 @@ import torch.nn.functional as F  # noqa: N812
 from pytorch_lightning import LightningModule, seed_everything
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import ModelConfig, TrainConfig
+from rfdetr.config import ModelConfig, OptimizerParamGroupOverride, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models import build_criterion_from_config, build_model_from_config
 from rfdetr.models.weights import (
@@ -30,6 +30,162 @@ from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
+
+
+def _split_optimizer_name(optimizer: str) -> tuple[str | None, str]:
+    """Split an optimizer string into optional provider and optimizer name.
+
+    Args:
+        optimizer: Optimizer config value, optionally prefixed with
+            ``"pytorch_optimizer:"`` or ``"pytorch-optimizer:"``.
+
+    Returns:
+        Tuple of provider and normalized optimizer name. Provider is ``None``
+        when no explicit prefix was supplied.
+    """
+    optimizer_name = optimizer.strip()
+    if ":" not in optimizer_name:
+        return None, optimizer_name.lower()
+
+    provider, name = optimizer_name.split(":", 1)
+    provider = provider.strip().lower().replace("-", "_")
+    name = name.strip()
+    if provider == "pytorch_optimizer":
+        name = name.lower()
+    else:
+        raise ValueError(f"Unsupported optimizer provider {provider!r}. Use 'adamw' or 'pytorch_optimizer:<name>'.")
+    if not name:
+        raise ValueError("optimizer provider prefix must be followed by a non-empty optimizer name.")
+    return provider, name
+
+
+def _is_default_adamw_optimizer(provider: str | None, optimizer_name: str) -> bool:
+    """Return whether the config selects RF-DETR's built-in AdamW path.
+
+    Args:
+        provider: Optional optimizer provider prefix.
+        optimizer_name: Normalized optimizer name.
+
+    Returns:
+        ``True`` when the built-in torch AdamW path should be used.
+    """
+    return provider is None and optimizer_name == "adamw"
+
+
+def _load_pytorch_optimizer(optimizer_name: str) -> type[torch.optim.Optimizer]:
+    """Load an optimizer class from pytorch-optimizer by name.
+
+    Args:
+        optimizer_name: Optimizer name understood by pytorch-optimizer.
+
+    Returns:
+        Optimizer class loaded from pytorch-optimizer.
+
+    Raises:
+        ImportError: If pytorch-optimizer is not installed.
+        NotImplementedError: If pytorch-optimizer does not know the optimizer.
+    """
+    try:
+        from pytorch_optimizer import load_optimizer
+    except ModuleNotFoundError as exc:
+        if exc.name != "pytorch_optimizer":
+            raise
+        raise ImportError(
+            f"pytorch-optimizer is required for optimizer={optimizer_name!r}. "
+            "Install it with `pip install pytorch-optimizer` or install RF-DETR with the training extra."
+        ) from exc
+    return load_optimizer(optimizer_name)
+
+
+def _get_param_group_parameters(param_group: dict[str, Any]) -> list[torch.Tensor]:
+    """Return materialized tensors from a PyTorch optimizer parameter group."""
+    params = param_group["params"]
+    if isinstance(params, torch.Tensor):
+        return [params]
+    if isinstance(params, (list, tuple)):
+        return list(params)
+    materialized_params = list(params)
+    param_group["params"] = materialized_params
+    return materialized_params
+
+
+def _param_group_matches_override(
+    param_group: dict[str, Any],
+    override: OptimizerParamGroupOverride,
+) -> bool:
+    """Return whether all tensors in a param group match a rank-based override."""
+    params = _get_param_group_parameters(param_group)
+    if not params:
+        return False
+    return all(
+        (override.min_ndim is None or param.ndim >= override.min_ndim)
+        and (override.max_ndim is None or param.ndim <= override.max_ndim)
+        for param in params
+    )
+
+
+def _apply_optimizer_param_group_overrides(
+    param_dicts: list[dict[str, Any]],
+    overrides: list[OptimizerParamGroupOverride],
+) -> list[dict[str, Any]]:
+    """Apply optimizer-specific kwargs to matching parameter groups."""
+    if not overrides:
+        return param_dicts
+
+    updated_param_dicts = []
+    for param_group in param_dicts:
+        updated_param_group = dict(param_group)
+        for override in overrides:
+            if _param_group_matches_override(updated_param_group, override):
+                updated_param_group.update(override.kwargs)
+        updated_param_dicts.append(updated_param_group)
+    return updated_param_dicts
+
+
+def _instantiate_optimizer(
+    optimizer_class: type[torch.optim.Optimizer],
+    optimizer_name: str,
+    param_dicts: list[dict[str, Any]],
+    train_config: TrainConfig,
+) -> torch.optim.Optimizer:
+    """Instantiate an optimizer class with RF-DETR optimizer arguments."""
+    try:
+        return optimizer_class(
+            param_dicts,
+            lr=train_config.lr,
+            weight_decay=train_config.weight_decay,
+            **train_config.optimizer_kwargs,
+        )
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(
+            f"Failed to initialize optimizer {optimizer_name!r}. "
+            "Check optimizer_kwargs and optimizer_param_group_overrides for arguments supported by that optimizer."
+        ) from exc
+
+
+def _build_pytorch_optimizer(
+    optimizer_name: str,
+    param_dicts: list[dict[str, Any]],
+    train_config: TrainConfig,
+) -> torch.optim.Optimizer:
+    """Build a pytorch-optimizer optimizer while preserving RF-DETR param groups.
+
+    Args:
+        optimizer_name: Optimizer name to load from pytorch-optimizer.
+        param_dicts: RF-DETR parameter groups with layer-wise learning rates.
+        train_config: Training config with base optimizer hyperparameters.
+
+    Returns:
+        Instantiated optimizer.
+    """
+    try:
+        optimizer_class = _load_pytorch_optimizer(optimizer_name)
+    except NotImplementedError as exc:
+        raise ValueError(
+            f"Unsupported pytorch-optimizer optimizer {optimizer_name!r}. "
+            "Check pytorch_optimizer.get_supported_optimizers() for available names."
+        ) from exc
+    return _instantiate_optimizer(optimizer_class, f"pytorch_optimizer:{optimizer_name}", param_dicts, train_config)
 
 
 class RFDETRModelModule(LightningModule):
@@ -59,7 +215,7 @@ class RFDETRModelModule(LightningModule):
             # classes (e.g. to match a fine-tuned head), persist that back onto
             # the model_config so downstream components see the aligned value.
             if hasattr(self.model, "num_classes"):
-                model_num_classes = getattr(self.model, "num_classes")
+                model_num_classes = self.model.num_classes
                 if model_num_classes is not None and model_num_classes != prev_num_classes:
                     self.model_config.num_classes = model_num_classes
         if model_config.backbone_lora:
@@ -255,11 +411,13 @@ class RFDETRModelModule(LightningModule):
         )
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        """Build AdamW optimizer with layer-wise LR decay and LambdaLR scheduler.
+        """Build the configured optimizer with layer-wise LR decay and scheduler.
 
         Uses ``trainer.estimated_stepping_batches`` for total step count so
         cosine annealing covers the full training run regardless of dataset
         size or accumulation settings.
+        ``optimizer="adamw"`` keeps RF-DETR's fused torch AdamW path;
+        other names can be loaded from ``pytorch-optimizer``.
 
         Returns:
             PTL optimizer config dict with optimizer and step-interval scheduler.
@@ -272,13 +430,32 @@ class RFDETRModelModule(LightningModule):
         # name-prefix mismatches that put the same tensor in multiple groups.
         model_for_params = getattr(self.model, "_orig_mod", self.model)
         param_dicts = get_param_dict(ns, model_for_params)
-        param_dicts = [p for p in param_dicts if p["params"].requires_grad]
-        optimizer = torch.optim.AdamW(
-            param_dicts,
-            lr=tc.lr,
-            weight_decay=tc.weight_decay,
-            fused=self._use_fused_optimizer,
-        )
+        param_dicts = [param_group for param_group in param_dicts if param_group["params"].requires_grad]
+        param_dicts = _apply_optimizer_param_group_overrides(param_dicts, tc.optimizer_param_group_overrides)
+
+        optimizer_provider, optimizer_name = _split_optimizer_name(tc.optimizer)
+        if _is_default_adamw_optimizer(optimizer_provider, optimizer_name):
+            try:
+                optimizer = torch.optim.AdamW(
+                    param_dicts,
+                    lr=tc.lr,
+                    weight_decay=tc.weight_decay,
+                    fused=self._use_fused_optimizer,
+                    **tc.optimizer_kwargs,
+                )
+            except TypeError as exc:
+                raise TypeError(
+                    "Failed to initialize optimizer 'adamw'. "
+                    "Check optimizer_kwargs for arguments supported by torch.optim.AdamW."
+                ) from exc
+        else:
+            if self.model_config.fused_optimizer:
+                logger.info(
+                    "fused_optimizer=True has no effect for optimizer=%r; "
+                    "the fused kernel is only applied when optimizer='adamw'.",
+                    tc.optimizer,
+                )
+            optimizer = _build_pytorch_optimizer(optimizer_name, param_dicts, tc)
 
         total_steps = int(self.trainer.estimated_stepping_batches)
         steps_per_epoch = max(1, total_steps // tc.epochs)
@@ -290,7 +467,7 @@ class RFDETRModelModule(LightningModule):
             if tc.lr_scheduler == "cosine":
                 progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
                 return tc.lr_min_factor + (1 - tc.lr_min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
-            # Step decay: drop by 10× after lr_drop epochs.
+            # Step decay: drop by 10x after lr_drop epochs.
             if current_step < tc.lr_drop * steps_per_epoch:
                 return 1.0
             return 0.1

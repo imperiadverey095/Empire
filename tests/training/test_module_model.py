@@ -81,6 +81,36 @@ def _fake_postprocess():
     return MagicMock(return_value=[{"boxes": torch.zeros(1, 4), "scores": torch.ones(1), "labels": torch.zeros(1)}])
 
 
+class _RecordingOptimizer(torch.optim.Optimizer):
+    """Optimizer test double that records constructor defaults and kwargs."""
+
+    def __init__(self, params, lr=1e-3, weight_decay=0.0, **kwargs):
+        self.extra_kwargs = dict(kwargs)
+        super().__init__(params, {"lr": lr, "weight_decay": weight_decay, **kwargs})
+
+    def step(self, closure=None):
+        """Run an optimizer step for the test double."""
+        if closure is not None:
+            return closure()
+        return None
+
+
+class _RankAwareRecordingOptimizer(torch.optim.Optimizer):
+    """Optimizer test double that rejects rank-gated flags on tensors below rank 2."""
+
+    def __init__(self, params, lr=1e-3, weight_decay=0.0, momentum=0.0, **kwargs):
+        super().__init__(params, {"lr": lr, "weight_decay": weight_decay, "momentum": momentum, **kwargs})
+        for param_group in self.param_groups:
+            if param_group.get("use_matrix_update") and any(param.ndim < 2 for param in param_group["params"]):
+                raise ValueError("use_matrix_update=True is only valid for tensors with ndim >= 2")
+
+    def step(self, closure=None):
+        """Run an optimizer step for the test double."""
+        if closure is not None:
+            return closure()
+        return None
+
+
 def _build_module(model_config=None, train_config=None, tmp_path=None):
     """Construct RFDETRModelModule with build_model_from_config and build_criterion_from_config mocked."""
     mc = model_config or _base_model_config()
@@ -739,7 +769,7 @@ class TestValidationStep:
 
     def test_postprocess_called_with_orig_sizes(self, tmp_path):
         """Postprocessor must receive original image sizes to rescale predictions."""
-        result, fake_pp, _ = self._run_val_step(tmp_path)
+        _result, fake_pp, _ = self._run_val_step(tmp_path)
         fake_pp.assert_called_once()
         orig_sizes = fake_pp.call_args[0][1]
         assert orig_sizes.shape == (2, 2)
@@ -798,7 +828,7 @@ class TestTestStep:
 
     def test_postprocess_called_with_orig_sizes(self, tmp_path):
         """Postprocessor must receive original image sizes to rescale predictions."""
-        result, fake_pp, _ = self._run_test_step(tmp_path)
+        _result, fake_pp, _ = self._run_test_step(tmp_path)
         fake_pp.assert_called_once()
         orig_sizes = fake_pp.call_args[0][1]
         assert orig_sizes.shape == (2, 2)
@@ -885,6 +915,177 @@ class TestConfigureOptimizers:
         mock_get_param_dict.return_value = param_dicts
 
         assert isinstance(module.configure_optimizers()["optimizer"], torch.optim.AdamW)
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_adamw_optimizer_kwargs_forwarded(self, mock_get_param_dict, tmp_path):
+        """optimizer_kwargs are forwarded to RF-DETR's default AdamW optimizer."""
+        optimizer_kwargs = {"betas": (0.8, 0.95), "eps": 1e-7}
+        module, param_dicts = self._setup_module(tmp_path, optimizer_kwargs=optimizer_kwargs)
+        mock_get_param_dict.return_value = param_dicts
+
+        optimizer = module.configure_optimizers()["optimizer"]
+
+        assert optimizer.defaults["betas"] == optimizer_kwargs["betas"]
+        assert optimizer.defaults["eps"] == pytest.approx(optimizer_kwargs["eps"])
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_custom_optimizer_uses_pytorch_optimizer_loader(self, mock_get_param_dict, tmp_path):
+        """Non-default optimizer names are resolved through pytorch-optimizer."""
+        module, param_dicts = self._setup_module(tmp_path, optimizer="lion")
+        mock_get_param_dict.return_value = param_dicts
+
+        with patch(
+            "rfdetr.training.module_model._load_pytorch_optimizer", return_value=_RecordingOptimizer
+        ) as mock_load:
+            optimizer = module.configure_optimizers()["optimizer"]
+
+        mock_load.assert_called_once_with("lion")
+        assert isinstance(optimizer, _RecordingOptimizer)
+        assert optimizer.defaults["lr"] == pytest.approx(module.train_config.lr)
+        assert optimizer.defaults["weight_decay"] == pytest.approx(module.train_config.weight_decay)
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_custom_optimizer_preserves_rfdetr_param_groups(self, mock_get_param_dict, tmp_path):
+        """Custom optimizers must receive RF-DETR param groups with layer-wise LR values."""
+        module, param_dicts = self._setup_module(tmp_path, optimizer="lion")
+        param_dicts[0]["lr"] = 2.5e-5
+        mock_get_param_dict.return_value = param_dicts
+
+        with patch("rfdetr.training.module_model._load_pytorch_optimizer", return_value=_RecordingOptimizer):
+            optimizer = module.configure_optimizers()["optimizer"]
+
+        assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(2.5e-5)
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_custom_optimizer_kwargs_forwarded(self, mock_get_param_dict, tmp_path):
+        """optimizer_kwargs are forwarded to the pytorch-optimizer constructor."""
+        optimizer_kwargs = {"betas": (0.9, 0.99), "weight_decouple": True}
+        module, param_dicts = self._setup_module(tmp_path, optimizer="lion", optimizer_kwargs=optimizer_kwargs)
+        mock_get_param_dict.return_value = param_dicts
+
+        with patch("rfdetr.training.module_model._load_pytorch_optimizer", return_value=_RecordingOptimizer):
+            optimizer = module.configure_optimizers()["optimizer"]
+
+        assert optimizer.extra_kwargs == optimizer_kwargs
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_pytorch_optimizer_prefix_allows_adamw_from_package(self, mock_get_param_dict, tmp_path):
+        """pytorch_optimizer: prefix opts into the external AdamW implementation."""
+        module, param_dicts = self._setup_module(tmp_path, optimizer="pytorch_optimizer:adamw")
+        mock_get_param_dict.return_value = param_dicts
+
+        with patch(
+            "rfdetr.training.module_model._load_pytorch_optimizer", return_value=_RecordingOptimizer
+        ) as mock_load:
+            optimizer = module.configure_optimizers()["optimizer"]
+
+        mock_load.assert_called_once_with("adamw")
+        assert isinstance(optimizer, _RecordingOptimizer)
+
+    @patch("rfdetr.training.module_model._load_pytorch_optimizer", return_value=_RankAwareRecordingOptimizer)
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_optimizer_param_group_overrides_apply_to_tensor_rank_matches(
+        self,
+        mock_get_param_dict,
+        mock_load_pto,
+        tmp_path,
+    ):
+        """Rank-based overrides support optimizer-specific flags only on 2D+ tensor groups."""
+        module, _ = self._setup_module(
+            tmp_path,
+            optimizer="lion",
+            optimizer_kwargs={"momentum": 0.9},
+            optimizer_param_group_overrides=[{"min_ndim": 2, "kwargs": {"use_matrix_update": True}}],
+        )
+        param_2d = nn.Parameter(torch.randn(4, 4))
+        param_1d = nn.Parameter(torch.randn(4))
+        mock_get_param_dict.return_value = [
+            {"params": param_2d, "lr": 2.5e-5},
+            {"params": param_1d, "lr": module.train_config.lr},
+        ]
+        mock_load_pto.return_value = _RankAwareRecordingOptimizer
+
+        optimizer = module.configure_optimizers()["optimizer"]
+
+        assert optimizer.defaults["momentum"] == pytest.approx(0.9)
+        assert optimizer.param_groups[0]["use_matrix_update"] is True
+        assert "use_matrix_update" not in optimizer.param_groups[1]
+        assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(2.5e-5)
+
+    @patch("rfdetr.training.module_model._load_pytorch_optimizer", return_value=_RankAwareRecordingOptimizer)
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_optimizer_param_group_overrides_can_apply_false_to_low_rank_tensors(
+        self,
+        mock_get_param_dict,
+        mock_load_pto,
+        tmp_path,
+    ):
+        """Rank-based overrides can explicitly mark lower-rank tensors for hybrid optimizers."""
+        module, _ = self._setup_module(
+            tmp_path,
+            optimizer="lion",
+            optimizer_param_group_overrides=[
+                {"max_ndim": 1, "kwargs": {"use_matrix_update": False}},
+                {"min_ndim": 2, "kwargs": {"use_matrix_update": True}},
+            ],
+        )
+        param_2d = nn.Parameter(torch.randn(4, 4))
+        param_1d = nn.Parameter(torch.randn(4))
+        mock_get_param_dict.return_value = [
+            {"params": param_2d, "lr": module.train_config.lr},
+            {"params": param_1d, "lr": module.train_config.lr},
+        ]
+        mock_load_pto.return_value = _RankAwareRecordingOptimizer
+
+        optimizer = module.configure_optimizers()["optimizer"]
+
+        assert optimizer.param_groups[0]["use_matrix_update"] is True
+        assert optimizer.param_groups[1]["use_matrix_update"] is False
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_missing_pytorch_optimizer_has_install_hint(self, mock_get_param_dict, tmp_path):
+        """Selecting a custom optimizer without pytorch-optimizer installed gives a clear install hint."""
+        module, param_dicts = self._setup_module(tmp_path, optimizer="lion")
+        mock_get_param_dict.return_value = param_dicts
+
+        with (
+            patch(
+                "rfdetr.training.module_model._load_pytorch_optimizer",
+                side_effect=ImportError("Install pytorch-optimizer"),
+            ),
+            pytest.raises(ImportError, match="pytorch-optimizer"),
+        ):
+            module.configure_optimizers()
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_invalid_pytorch_optimizer_name_raises_value_error(self, mock_get_param_dict, tmp_path):
+        """Unsupported optimizer names are reported as configuration errors."""
+        module, param_dicts = self._setup_module(tmp_path, optimizer="not_real")
+        mock_get_param_dict.return_value = param_dicts
+
+        with (
+            patch(
+                "rfdetr.training.module_model._load_pytorch_optimizer",
+                side_effect=NotImplementedError("not implemented optimizer : not_real"),
+            ),
+            pytest.raises(ValueError, match="not_real"),
+        ):
+            module.configure_optimizers()
+
+    @patch("rfdetr.training.module_model.get_param_dict")
+    def test_real_pytorch_optimizer_lion_smoke(self, mock_get_param_dict, tmp_path):
+        """Real pytorch-optimizer Lion can be constructed when the package is installed."""
+        pytest.importorskip("pytorch_optimizer")
+        module, param_dicts = self._setup_module(
+            tmp_path,
+            optimizer="lion",
+            optimizer_kwargs={"weight_decouple": True},
+        )
+        mock_get_param_dict.return_value = param_dicts
+
+        optimizer = module.configure_optimizers()["optimizer"]
+
+        assert optimizer.__class__.__name__ == "Lion"
 
     @patch("rfdetr.training.module_model.get_param_dict")
     def test_scheduler_interval_is_step(self, mock_get_param_dict, tmp_path):
@@ -1076,7 +1277,7 @@ class TestClipGradients:
         module.clip_gradients(MagicMock(), gradient_clip_val=0.5)
 
         mock_clip_grad_norm.assert_called_once()
-        _, call_kwargs = mock_clip_grad_norm.call_args
+        _, _call_kwargs = mock_clip_grad_norm.call_args
         # Positional arg[1] is max_norm
         assert mock_clip_grad_norm.call_args[0][1] == pytest.approx(0.5)
 
