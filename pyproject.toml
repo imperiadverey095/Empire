@@ -201,6 +201,7 @@ filterwarnings = [
 
 [tool.codespell]
 skip = "*.pth"
+ignore-words-list = "dota"
 
 [tool.mypy]
 python_version = "3.10"
@@ -244,6 +245,7 @@ overrides = [
     "rfdetr.config",
     "rfdetr.datasets._develop",
     "rfdetr.datasets.coco",
+    "rfdetr.datasets.dota_detection",
     "rfdetr.datasets.save_grids",
     "rfdetr.datasets.synthetic",
     "rfdetr.datasets.transforms",

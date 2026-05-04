@@ -29,6 +29,7 @@ from torch import nn
 from rfdetr.models.heads.segmentation import point_sample
 from rfdetr.utilities.box_ops import batch_dice_loss, batch_sigmoid_ce_loss, box_cxcywh_to_xyxy, generalized_box_iou
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.rotated_box_ops import gwd_pairwise
 
 logger = get_logger()
 _SANITIZED_COST_MARGIN = 1.0
@@ -52,6 +53,7 @@ class HungarianMatcher(nn.Module):
         mask_point_sample_ratio: int = 16,
         cost_mask_ce: float = 1,
         cost_mask_dice: float = 1,
+        oriented: bool = False,
     ):
         """Creates the matcher.
 
@@ -65,6 +67,7 @@ class HungarianMatcher(nn.Module):
             mask_point_sample_ratio: Downsampling ratio for mask point sampling.
             cost_mask_ce: Relative weight of the binary cross-entropy mask cost.
             cost_mask_dice: Relative weight of the Dice mask cost.
+            oriented: If ``True``, use GWD cost instead of GIoU for rotated boxes.
         """
         super().__init__()
         self.cost_class = cost_class
@@ -75,6 +78,7 @@ class HungarianMatcher(nn.Module):
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.oriented = oriented
         self._warned_non_finite_costs = False
 
     @staticmethod
@@ -142,17 +146,20 @@ class HungarianMatcher(nn.Module):
         # We flatten to compute the cost matrices in a batch
         flat_pred_logits = outputs["pred_logits"].flatten(0, 1)
         out_prob = flat_pred_logits.sigmoid()  # [batch_size * num_queries, num_classes]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4 or 5]
 
         # Also concat the target labels and boxes
         tgt_ids = torch.cat([v["labels"] for v in targets])
-        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        tgt_bbox_key = "boxes_obb" if self.oriented else "boxes"
+        tgt_bbox = torch.cat([v[tgt_bbox_key] for v in targets])
 
         masks_present = "masks" in targets[0]
 
-        # Compute the giou cost between boxes
-        giou = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-        cost_giou = -giou
+        if self.oriented:
+            cost_giou = gwd_pairwise(out_bbox, tgt_bbox)
+        else:
+            giou = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            cost_giou = -giou
 
         # Compute the classification cost.
         alpha = 0.25
@@ -165,8 +172,10 @@ class HungarianMatcher(nn.Module):
         pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-F.logsigmoid(flat_pred_logits))
         cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
 
-        # Compute the L1 cost between boxes
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        # Compute the L1 cost between boxes (spatial dims only for oriented)
+        out_bbox_spatial = out_bbox[..., :4] if self.oriented else out_bbox
+        tgt_bbox_spatial = tgt_bbox[..., :4] if self.oriented else tgt_bbox
+        cost_bbox = torch.cdist(out_bbox_spatial, tgt_bbox_spatial, p=1)
 
         if masks_present:
             tgt_masks = torch.cat([v["masks"] for v in targets])
@@ -229,7 +238,7 @@ class HungarianMatcher(nn.Module):
                 self._warned_non_finite_costs = True
             cost_matrix = self._sanitize_cost_matrix(cost_matrix)
 
-        sizes = [len(v["boxes"]) for v in targets]
+        sizes = [len(v[tgt_bbox_key]) for v in targets]
         indices = []
         g_num_queries = num_queries // group_detr
         cost_matrix_list = cost_matrix.split(g_num_queries, dim=1)
@@ -250,6 +259,7 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
+    oriented = getattr(args, "oriented", False)
     if args.segmentation_head:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
@@ -259,6 +269,7 @@ def build_matcher(args):
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            oriented=oriented,
         )
     else:
         return HungarianMatcher(
@@ -266,4 +277,5 @@ def build_matcher(args):
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
+            oriented=oriented,
         )
