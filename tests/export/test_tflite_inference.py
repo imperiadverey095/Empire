@@ -219,7 +219,7 @@ class TestRunInference:
         assert len(dets) >= 1
 
     def test_detections_below_threshold_filtered(self, rgb_image: Path) -> None:
-        """No detections survive when all logits are zero (uniform probs < 0.3)."""
+        """No detections survive when all logits are very negative (sigmoid≈0.0001 < threshold 0.3)."""
         interp = _make_interp(logits=_make_logits(high_conf_idx=None))
         dets, _ = _run_inference(interp, rgb_image, threshold=0.3)
         assert len(dets) == 0
@@ -291,6 +291,32 @@ class TestRunInference:
         interp.get_output_details.return_value = [_DET_OUTPUT, _LABEL_OUTPUT]
         with pytest.raises(ValueError, match="float32"):
             _run_inference(interp, rgb_image)
+
+    def test_preprocessing_uses_bilinear_resampling(self, tmp_path: Path) -> None:
+        """Tensor fed to interpreter matches BILINEAR-resized preprocessing exactly.
+
+        BICUBIC (PIL default) and BILINEAR produce different pixel values on structured
+        images; this test guards against regression to the BICUBIC default.
+        """
+        # Checkerboard gives sharp edges where BILINEAR and BICUBIC differ.
+        checker_size = 64
+        checker = np.zeros((checker_size, checker_size, 3), dtype=np.uint8)
+        checker[::2, ::2] = 255
+        img_path = tmp_path / "checker.png"
+        PILImage.fromarray(checker).save(img_path)
+
+        interp = _make_interp()
+        _run_inference(interp, img_path)
+        actual_tensor = interp.set_tensor.call_args[0][1]  # shape (1, H, W, C)
+
+        _, height, width, _ = _INPUT_SHAPE
+        pil_img = PILImage.open(img_path).convert("RGB")
+        bilinear_arr = np.array(pil_img.resize((width, height), PILImage.Resampling.BILINEAR), dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        expected = ((bilinear_arr - mean) / std)[np.newaxis]
+
+        np.testing.assert_allclose(actual_tensor, expected, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

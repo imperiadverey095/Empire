@@ -650,6 +650,28 @@ class RFDETR:
         trainer = build_trainer(config, self.model_config, **trainer_kwargs)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
+        # BestModelCallback saves the best checkpoint to disk but only loads it back
+        # into module.model when run_test=True. Without this step, predict() and
+        # export() use the final-epoch weights (EMA or regular) instead of the
+        # best-epoch weights — causing a mismatch with from_checkpoint() results.
+        _best_ckpt_path = Path(config.output_dir) / "checkpoint_best_total.pth"
+        if _best_ckpt_path.exists():
+            try:
+                _best_ckpt = torch.load(_best_ckpt_path, map_location="cpu", weights_only=False)
+                _orig = getattr(module.model, "_orig_mod", None)
+                _raw_model = _orig if isinstance(_orig, torch.nn.Module) else module.model
+                _raw_model.load_state_dict(_best_ckpt["model"], strict=True)
+                logger.info(
+                    "Loaded best checkpoint into model from %s — predict() and export() will use best weights.",
+                    _best_ckpt_path,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not load best checkpoint from %s; predict() will use final-epoch weights.",
+                    _best_ckpt_path,
+                    exc_info=True,
+                )
+
         # Sync the trained weights back so predict() / export() see the updated model.
         self.model.model = module.model
         # Sync class names: prefer explicit config.class_names, otherwise fall back to dataset (#509).

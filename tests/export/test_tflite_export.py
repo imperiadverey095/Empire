@@ -34,6 +34,7 @@ from rfdetr.export._tflite.converter import (
     _VALID_QUANTIZATIONS,
     _check_onnx2tf_available,
     _get_onnx_input_info,
+    _imagenet_normalize,
     _load_calibration_images,
     _numpy_allow_pickle,
     _patch_validation_download,
@@ -196,7 +197,7 @@ class TestExportTfliteConverter:
 
         convert_mock.assert_called_once()
         kwargs = convert_mock.call_args.kwargs
-        assert kwargs["input_onnx_file_path"] == str(onnx_model)
+        assert kwargs["input_onnx_file_path"] == str(tflite_output / "_simplified" / onnx_model.name)
         assert kwargs["output_folder_path"] == str(tflite_output)
         assert kwargs["output_signaturedefs"] is True
         assert kwargs["non_verbose"] is True
@@ -270,9 +271,27 @@ class TestExportTfliteConverter:
         fake_onnx2tf: Any,
         mock_prepare_calib: Any,
     ) -> None:
+        """INT8 export passes output_integer_quantized_tflite=True to onnx2tf."""
         _, convert_mock = fake_onnx2tf
         export_tflite(onnx_model, tflite_output, quantization="int8")
         assert convert_mock.call_args.kwargs["output_integer_quantized_tflite"] is True
+
+    def test_int8_returns_integer_quant_path(
+        self,
+        onnx_model: Path,
+        tmp_path: Path,
+        fake_onnx2tf: Any,
+        mock_prepare_calib: Any,
+    ) -> None:
+        """INT8 export returns _integer_quant.tflite, not _float32.tflite."""
+        out = tmp_path / "int8_out"
+        out.mkdir()
+        (out / f"{onnx_model.stem}_float32.tflite").write_bytes(b"fp32")
+        (out / f"{onnx_model.stem}_integer_quant.tflite").write_bytes(b"int8")
+
+        result = export_tflite(onnx_model, out, quantization="int8")
+
+        assert result.name == f"{onnx_model.stem}_integer_quant.tflite"
 
     def test_verbosity_forwarded(
         self,
@@ -724,6 +743,7 @@ class TestPrepareCalibrationData:
             assert "INT8" in mock_logger.warning.call_args[0][0]
 
     def test_ndarray_saves_to_npy(self, tmp_path: Path, _mock_onnx_info: None) -> None:
+        """ndarray input is ImageNet-normalised before saving."""
         onnx_path = tmp_path / "model.onnx"
         onnx_path.write_bytes(b"\x00")
         calib = np.random.rand(10, 256, 256, 3).astype(np.float32)
@@ -731,17 +751,22 @@ class TestPrepareCalibrationData:
         npy_path = _prepare_calibration_data(onnx_path, calib, tmp_path, "fp32")
 
         loaded = np.load(str(npy_path))
-        np.testing.assert_array_equal(loaded, calib)
+        expected = _imagenet_normalize(calib)
+        np.testing.assert_array_almost_equal(loaded, expected)
 
-    def test_path_string_used_directly(self, tmp_path: Path, _mock_onnx_info: None) -> None:
+    def test_path_string_normalises_and_saves_copy(self, tmp_path: Path, _mock_onnx_info: None) -> None:
+        """A .npy file path is normalised to ImageNet stats and saved as a copy."""
         onnx_path = tmp_path / "model.onnx"
         onnx_path.write_bytes(b"\x00")
+        raw = np.random.rand(5, 256, 256, 3).astype(np.float32)
         npy_file = tmp_path / "my_calib.npy"
-        np.save(str(npy_file), np.zeros((5, 256, 256, 3), dtype=np.float32))
+        np.save(str(npy_file), raw)
 
         npy_path = _prepare_calibration_data(onnx_path, str(npy_file), tmp_path, "fp32")
 
-        assert npy_path == npy_file
+        assert npy_path.is_file()
+        loaded = np.load(str(npy_path))
+        np.testing.assert_array_almost_equal(loaded, _imagenet_normalize(raw))
 
     def test_directory_loads_images(self, tmp_path: Path, _mock_onnx_info: None) -> None:
         """A directory path triggers image loading and .npy creation."""
@@ -876,6 +901,126 @@ class TestLoadCalibrationImages:
         assert ".jpg" in _IMAGE_EXTENSIONS
         assert ".png" in _IMAGE_EXTENSIONS
 
+    @pytest.mark.parametrize(
+        "channels, pil_mode",
+        [
+            pytest.param(1, "L", id="grayscale"),
+            pytest.param(3, "RGB", id="rgb"),
+        ],
+    )
+    def test_channels_parameter_preserved(self, tmp_path: Path, channels: int, pil_mode: str) -> None:
+        """Output last dim equals requested channel count for PIL-loadable modes (L=1, RGB=3)."""
+        from PIL import Image
+
+        for i in range(3):
+            Image.new(pil_mode, (32, 32), color=(i * 40) % 256).save(tmp_path / f"img_{i}.png")
+
+        result = _load_calibration_images(tmp_path, height=16, width=16, channels=channels)
+        assert result.shape[-1] == channels
+        assert result.dtype == np.float32
+
+    def test_grayscale_adds_channel_axis(self, tmp_path: Path) -> None:
+        """L-mode images produce (N, H, W, 1) output, not (N, H, W)."""
+        from PIL import Image
+
+        for i in range(3):
+            Image.new("L", (32, 32), color=i * 80).save(tmp_path / f"gray_{i}.png")
+
+        result = _load_calibration_images(tmp_path, height=16, width=16, channels=1)
+        assert result.shape == (3, 16, 16, 1)
+
+
+# ---------------------------------------------------------------------------
+# TestImagenetNormalizeChannels
+# ---------------------------------------------------------------------------
+
+
+class TestImagenetNormalizeChannels:
+    """Tests for channel-aware ``_imagenet_normalize``."""
+
+    @pytest.mark.parametrize("num_channels", [1, 2, 3, 4, 5])
+    def test_preserves_channel_count(self, num_channels: int) -> None:
+        """Output shape[-1] equals input shape[-1] for any channel count."""
+        arr = np.zeros((2, 8, 8, num_channels), dtype=np.float32)
+        out = _imagenet_normalize(arr)
+        assert out.shape == arr.shape
+        assert out.shape[-1] == num_channels
+
+    def test_three_channel_matches_legacy_stats(self) -> None:
+        """3-channel normalization produces exactly the legacy ImageNet values."""
+        from rfdetr.export._tflite.converter import _IMAGENET_MEAN, _IMAGENET_STD
+
+        arr = np.zeros((1, 4, 4, 3), dtype=np.float32)
+        out = _imagenet_normalize(arr)
+        expected = (arr - _IMAGENET_MEAN) / _IMAGENET_STD
+        np.testing.assert_array_almost_equal(out, expected)
+
+
+# ---------------------------------------------------------------------------
+# TestPrepareCalibrationDataNonRGB (new non-RGB fixtures)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareCalibrationDataNonRGB:
+    """Tests for non-RGB calibration data preparation."""
+
+    @pytest.fixture()
+    def _mock_1ch_onnx(self) -> Generator:
+        """Mock ``_get_onnx_input_info`` to return a 1-channel shape."""
+        with mock.patch(
+            "rfdetr.export._tflite.converter._get_onnx_input_info",
+            return_value=("input", [1, 1, 8, 8]),
+        ):
+            yield
+
+    def test_random_grayscale_saves_correct_shape(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """Random calibration for a 1-channel model produces (N, H, W, 1) npy."""
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+
+        npy_path = _prepare_calibration_data(onnx_path, None, tmp_path, "fp32")
+
+        data = np.load(str(npy_path))
+        assert data.shape == (_DEFAULT_CALIB_SAMPLES, 8, 8, 1)
+        assert data.dtype == np.float32
+
+    def test_ndarray_grayscale_shape_preserved(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """User-supplied (N, H, W, 1) array saves as (N, H, W, 1)."""
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+        calib = np.zeros((4, 8, 8, 1), dtype=np.float32)
+
+        npy_path = _prepare_calibration_data(onnx_path, calib, tmp_path, "fp32")
+
+        data = np.load(str(npy_path))
+        assert data.shape == (4, 8, 8, 1)
+
+    def test_ndarray_channel_mismatch_raises(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """3-channel ndarray passed to a 1-channel model raises ValueError."""
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+        calib = np.zeros((4, 8, 8, 3), dtype=np.float32)
+
+        with pytest.raises(ValueError, match="last dim == 1"):
+            _prepare_calibration_data(onnx_path, calib, tmp_path, "fp32")
+
+    def test_directory_grayscale_saves_correct_shape(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """Directory of L-mode images + 1-channel model → saved (N, H, W, 1) npy."""
+        from PIL import Image
+
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+        img_dir = tmp_path / "images"
+        img_dir.mkdir()
+        for i in range(4):
+            Image.new("L", (16, 16), color=i * 60).save(img_dir / f"gray_{i}.png")
+
+        npy_path = _prepare_calibration_data(onnx_path, str(img_dir), tmp_path, "fp32")
+
+        data = np.load(str(npy_path))
+        assert data.shape == (4, 8, 8, 1)
+        assert data.dtype == np.float32
+
 
 # ---------------------------------------------------------------------------
 # TestCheckOnnx2tfAvailable
@@ -893,3 +1038,153 @@ class TestCheckOnnx2tfAvailable:
         with mock.patch.dict(sys.modules, {"onnx2tf": None}):
             with pytest.raises(ImportError, match="onnx2tf is not installed"):
                 _check_onnx2tf_available()
+
+
+# ---------------------------------------------------------------------------
+# TestGridSampleKwargDetection
+# ---------------------------------------------------------------------------
+
+
+class TestGridSampleKwargDetection:
+    """Tests for runtime detection of the onnx2tf GridSample replacement kwarg."""
+
+    def test_kwarg_is_detected_when_present(self) -> None:
+        """Detected kwarg name must contain both 'grid' and 'pseudo'."""
+        from rfdetr.export._tflite.converter import _GRIDSAMPLE_KWARG
+
+        if _GRIDSAMPLE_KWARG is not None:
+            lower = _GRIDSAMPLE_KWARG.lower()
+            assert "grid" in lower
+            assert "pseudo" in lower
+
+    def test_detection_does_not_raise_on_import(self) -> None:
+        """Module import must succeed regardless of installed onnx2tf version."""
+        import rfdetr.export._tflite.converter  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# TestGridSampleKwargForwarded
+# ---------------------------------------------------------------------------
+
+
+class TestGridSampleKwargForwarded:
+    """Tests that the detected GridSample kwarg is forwarded to onnx2tf.convert."""
+
+    def test_gridsample_kwarg_in_convert_call(
+        self,
+        onnx_model: Path,
+        tflite_output: Path,
+        fake_onnx2tf: Any,
+        mock_prepare_calib: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GridSample replacement kwarg must appear in kwargs forwarded to convert().
+
+        Uses a synthetic kwarg name so the test runs regardless of installed
+        onnx2tf version.  The injection logic is what matters here.
+        """
+        from rfdetr.export._tflite import converter as conv_mod
+
+        test_kwarg = "replace_GridSample_to_pseudo_GridSample"
+        monkeypatch.setattr(conv_mod, "_GRIDSAMPLE_KWARG", test_kwarg)
+
+        _, convert_mock = fake_onnx2tf
+        export_tflite(onnx_model, tflite_output)
+
+        convert_mock.assert_called_once()
+        assert convert_mock.call_args.kwargs[test_kwarg] is True
+
+
+# ---------------------------------------------------------------------------
+# TestSkipInt16ActivationQuantization
+# ---------------------------------------------------------------------------
+
+
+class TestSkipInt16ActivationQuantization:
+    """Tests for the int16-activation calibration fast-skip patch."""
+
+    def test_int16_quantize_calls_raise_immediately(self) -> None:
+        """When the patch is active, a _quantize call with int16 activations raises without running the calibrator."""
+        try:
+            import tensorflow as tf
+        except ImportError:
+            pytest.skip("tensorflow not installed")
+
+        from rfdetr.export._tflite.converter import _skip_int16_activation_quantization
+
+        with _skip_int16_activation_quantization():
+            from tensorflow.lite.python import lite as _tf_lite
+
+            target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+            with pytest.raises(RuntimeError, match="int16 activations skipped"):
+                # Args are placeholders — the patched method should raise
+                # before touching them.
+                target_cls._quantize(
+                    None,
+                    b"\x00",
+                    tf.int8,
+                    tf.int8,
+                    tf.int16,
+                )
+
+    def test_int8_activations_still_call_through(self) -> None:
+        """The patch must NOT short-circuit non-int16 activation calls."""
+        try:
+            import tensorflow as tf
+        except ImportError:
+            pytest.skip("tensorflow not installed")
+
+        from tensorflow.lite.python import lite as _tf_lite
+
+        from rfdetr.export._tflite.converter import _skip_int16_activation_quantization
+
+        target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+        called_with: list = []
+        original = target_cls._quantize
+
+        def _stub(self, model, q_in, q_out, q_act, *a, **k):  # type: ignore[no-untyped-def]
+            called_with.append((q_in, q_out, q_act))
+            return b"stub-model"
+
+        target_cls._quantize = _stub
+        try:
+            with _skip_int16_activation_quantization():
+                result = target_cls._quantize(None, b"\x00", tf.int8, tf.int8, tf.int8)
+            assert result == b"stub-model"
+            assert called_with == [(tf.int8, tf.int8, tf.int8)]
+        finally:
+            target_cls._quantize = original
+
+    def test_patch_restores_original_method(self) -> None:
+        """The original _quantize must be restored after the context exits."""
+        try:
+            from tensorflow.lite.python import lite as _tf_lite
+        except ImportError:
+            pytest.skip("tensorflow not installed")
+
+        from rfdetr.export._tflite.converter import _skip_int16_activation_quantization
+
+        target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+        before = target_cls._quantize
+        with _skip_int16_activation_quantization():
+            assert target_cls._quantize is not before
+        assert target_cls._quantize is before
+
+    def test_no_op_when_tensorflow_not_importable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When TF cannot be imported, the context manager must be a no-op (must not raise)."""
+        import builtins
+
+        from rfdetr.export._tflite import converter as conv_mod
+
+        original_import = builtins.__import__
+
+        def _no_tf(name: str, *a: Any, **k: Any) -> Any:
+            if name.startswith("tensorflow"):
+                raise ImportError("simulated: tensorflow missing")
+            return original_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", _no_tf)
+
+        # Must complete without raising
+        with conv_mod._skip_int16_activation_quantization():
+            pass
